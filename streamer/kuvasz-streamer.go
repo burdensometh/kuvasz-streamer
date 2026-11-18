@@ -79,6 +79,10 @@ func main() {
 	RootChannel = make(chan string)
 	for {
 		SetStatus(StatusStarting)
+		// Clear any transaction state and in-memory progress watermarks left
+		// from the previous run. Durable progress is reloaded and reconciled
+		// against each replication slot before streaming resumes.
+		ResetWorkers()
 		err := SetupDestination()
 		if err != nil {
 			log.Error("Error setting up destination", "err", err)

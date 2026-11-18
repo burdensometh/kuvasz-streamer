@@ -50,6 +50,13 @@ var (
 			Help: "Timestamp of last known activity",
 		}, []string{"database", "sid"},
 	)
+
+	progressErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "streamer_progress_errors_total",
+			Help: "Total number of errors while persisting or verifying durable replication progress.",
+		},
+	)
 )
 
 func getMetricValue(col prometheus.Collector) float64 {

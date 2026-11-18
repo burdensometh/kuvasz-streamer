@@ -234,6 +234,15 @@ func ReplicateDatabase(rootContext context.Context, database SourceDatabase, url
 		time.Sleep(time.Duration(config.Maintenance.StartDelay) * time.Second)
 	}
 
+	// Cross-check the durable progress against the slot position and initialize
+	// the in-memory watermark before opening the replication stream. A
+	// divergence that cannot be recovered (durable progress behind the slot's
+	// confirmed_flush_lsn) aborts replication rather than being logged and
+	// ignored.
+	if err := ReconcileProgress(ctx, log, database.Name, url.SID, lsn); err != nil {
+		return fmt.Errorf("cannot reconcile replication progress: %w", err)
+	}
+
 	// Start replication
 	log.Debug("Starting replication slot")
 	protocolVersion, args := pluginArguments(ver, slotName)
@@ -262,7 +271,6 @@ func ReplicateDatabase(rootContext context.Context, database SourceDatabase, url
 	inStream := false
 	transactionLSN := pglogrepl.LSN(0)
 	committedTransactionLSN := lsn
-	SetCommittedLSN(database.Name, url.SID, lsn)
 
 	for {
 		urlHeartbeat.WithLabelValues(database.Name, url.SID).Set(float64(time.Now().Unix()))

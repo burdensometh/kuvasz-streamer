@@ -203,6 +203,12 @@ func SetupDestination() error {
 	}
 	log.Info("Connected to target database", "url", config.Database.URL)
 
+	// Ensure the durable replication progress table exists before any worker
+	// can reference it.
+	if err := EnsureProgressTable(context.Background()); err != nil {
+		return err
+	}
+
 	// Get connection
 	conn, err := DestConnectionPool.Acquire(context.Background())
 	if err != nil {
