@@ -40,13 +40,14 @@ type (
 		JWTKey string `koanf:"jwt_key"`
 	}
 	AppConfig struct {
-		MapFile       string     `koanf:"map_file"`
-		MapDatabase   string     `koanf:"map_database"`
-		NumWorkers    int        `koanf:"num_workers"`
-		CommitDelay   float64    `koanf:"commit_delay"`
-		DefaultSchema string     `koanf:"default_schema"`
-		SyncRate      rate.Limit `koanf:"sync_rate"`
-		SyncBurst     int        `koanf:"sync_burst"`
+		MapFile        string     `koanf:"map_file"`
+		MapDatabase    string     `koanf:"map_database"`
+		NumWorkers     int        `koanf:"num_workers"`
+		CommitDelay    float64    `koanf:"commit_delay"`
+		DefaultSchema  string     `koanf:"default_schema"`
+		StateDirectory string     `koanf:"state_directory"`
+		SyncRate       rate.Limit `koanf:"sync_rate"`
+		SyncBurst      int        `koanf:"sync_burst"`
 	}
 
 	CORSConfig struct {
@@ -89,13 +90,14 @@ var config = Config{
 		Schema: "public",
 	},
 	App: AppConfig{
-		MapFile:       "/etc/kuvasz/map.yaml",
-		MapDatabase:   "",
-		NumWorkers:    2,
-		CommitDelay:   1.0,
-		DefaultSchema: "public",
-		SyncRate:      1_000_000_000,
-		SyncBurst:     1_000,
+		MapFile:        "/etc/kuvasz/map.yaml",
+		MapDatabase:    "",
+		NumWorkers:     2,
+		CommitDelay:    1.0,
+		DefaultSchema:  "public",
+		StateDirectory: "./state",
+		SyncRate:       1_000_000_000,
+		SyncBurst:      1_000,
 	},
 	Cors: CORSConfig{
 		AllowedOrigins:   []string{"*"},

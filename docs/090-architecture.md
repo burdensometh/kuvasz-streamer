@@ -17,9 +17,15 @@ Depending on the running mode, it also reads its mapping configuration either fr
 
 On startup `kuvasz-streamer` will check the state of the publications and replication slots. If they don't exist, it will create them and initiate a full sync. If the slot exists but some tables have been added, a full sync for these tables only is performed.
 
+The full sync and the subsequent WAL stream must share one consistency boundary. When the logical slot is created with `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT`, PostgreSQL returns both the slot's consistent point (an LSN) and an exportable snapshot. `kuvasz-streamer` records this boundary in its on-disk state file (`state_directory`, phase `snapshot`) before reading any data, then opens a separate read-only transaction on a regular (non-replication) connection and runs `SET TRANSACTION SNAPSHOT` to import that snapshot. Every configured table is copied through the same snapshot transaction, so all tables are observed at exactly the slot's consistency point. Changes committed on the source while the copy runs are not part of the snapshot; they are delivered afterwards through the WAL stream, which starts at the slot LSN. The starting LSN always comes from the slot itself, never from an `IDENTIFY_SYSTEM` position taken before the slot existed.
+
+If the process dies before the snapshot copy completes, the state file remains in phase `snapshot`. On restart `kuvasz-streamer` detects the unfinished snapshot, drops the half-used slot, cleans the partially populated destination tables and recreates everything from a freshly exported boundary instead of treating the partial copy as a successful initialization. Only after the snapshot transaction commits is the phase switched to `streaming`; from then on restarts resume from the slot's `confirmed_flush_lsn`.
+
 ![Architecture](/assets/images/initialsync.png)
 
 A separate goroutine is created for each source to handle the initial sync process. Source tables are synchronized sequentially within that source. Parallelizing this would increase the load substantially on the source server but may be something to look at in the future.
+
+The current implementation is scoped to one source instance and ordinary tables using a single-database snapshot; cross-database snapshots are not supported.
 
 ## Streaming mode
 

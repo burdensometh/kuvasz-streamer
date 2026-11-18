@@ -40,45 +40,94 @@ func pluginArguments(pgVersion int, slotName string) (int, []string) {
 	return protocolVersion, arg
 }
 
+// slotCreation is the consistency boundary returned by CREATE_REPLICATION_SLOT.
+// Both the initial full read (via the exported snapshot) and the subsequent WAL
+// stream (started at SlotLSN) must come from this single boundary.
+type slotCreation struct {
+	slotName     string
+	slotLSN      pglogrepl.LSN
+	snapshotName string
+}
+
+// createReplicationSlot creates the logical replication slot when it does not
+// exist and exports the snapshot that the initial full read must use. When the
+// slot already exists its confirmed_flush_lsn is returned instead.
+//
+// The starting LSN is always taken from the slot itself (the create command's
+// consistent point, or confirmed_flush_lsn for an existing slot); it is never
+// the IdentifySystem() XLogPos queried before creating the slot, which does not
+// share a boundary with any snapshot.
 func createReplicationSlot(
 	log *slog.Logger,
 	conn *pgx.Conn,
 	slotName string,
-	xlogpos pglogrepl.LSN) (bool, pglogrepl.LSN, error) {
+) (created bool, result slotCreation, err error) {
 	ctx := context.Background()
 	replConn := conn.PgConn()
 	log.Info("Checking replication slot", "slotname", slotName)
 	var active bool
 	var activePid *int
-	var lsn pglogrepl.LSN
-	err := conn.QueryRow(
+	var existingLSN pglogrepl.LSN
+	err = conn.QueryRow(
 		ctx,
 		"select active, active_pid, confirmed_flush_lsn from pg_replication_slots where slot_name=$1;",
-		slotName).Scan(&active, &activePid, &lsn)
+		slotName).Scan(&active, &activePid, &existingLSN)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, fmt.Errorf("cannot check existence of replication slot: %w", err)
+		return false, slotCreation{}, fmt.Errorf("cannot check existence of replication slot: %w", err)
 	}
 	if active {
-		return false, 0, fmt.Errorf("cannot create replication, slot is active, slot_name=%s, active_pid=%d", slotName, *activePid)
+		return false, slotCreation{}, fmt.Errorf("cannot create replication, slot is active, slot_name=%s, active_pid=%d", slotName, *activePid)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		log.Debug("Replication slot exists", "lsn", lsn)
-		return true, lsn, nil
+		log.Info("Replication slot exists", "lsn", existingLSN)
+		return false, slotCreation{slotName: slotName, slotLSN: existingLSN}, nil
 	}
+
+	// Export a snapshot so the full read can be taken on the exact consistency
+	// point of the slot. The snapshot stays valid as long as the slot exists.
 	replicationSlotResult, err := pglogrepl.CreateReplicationSlot(
 		ctx,
 		replConn,
 		slotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{
 			Temporary:      false,
-			SnapshotAction: "",
+			SnapshotAction: "EXPORT_SNAPSHOT",
 			Mode:           pglogrepl.LogicalReplication,
 		})
 	if err != nil {
-		return false, 0, fmt.Errorf("cannot create replication slot: %w", err)
+		return false, slotCreation{}, fmt.Errorf("cannot create replication slot: %w", err)
 	}
-	log.Debug("Created replication slot", "result", replicationSlotResult)
-	return false, xlogpos, nil
+	slotLSN, err := pglogrepl.ParseLSN(replicationSlotResult.ConsistentPoint)
+	if err != nil {
+		return false, slotCreation{}, fmt.Errorf("cannot parse slot consistent point=%s, error=%w", replicationSlotResult.ConsistentPoint, err)
+	}
+	if replicationSlotResult.SnapshotName == "" {
+		return false, slotCreation{}, fmt.Errorf("replication slot %s created without an exported snapshot", slotName)
+	}
+	log.Info("Created replication slot",
+		"slotname", replicationSlotResult.SlotName,
+		"lsn", slotLSN,
+		"snapshot", replicationSlotResult.SnapshotName)
+	return true, slotCreation{
+		slotName:     replicationSlotResult.SlotName,
+		slotLSN:      slotLSN,
+		snapshotName: replicationSlotResult.SnapshotName,
+	}, nil
+}
+
+// dropReplicationSlot removes a slot whose initial snapshot never completed.
+// Nothing has been replayed from it yet, so recreating it from scratch loses no
+// committed work. A slot that is already gone is treated as success, because
+// the desired end state (no slot) is reached.
+func dropReplicationSlot(ctx context.Context, conn *pgx.Conn, slotName string) error {
+	if _, err := conn.Exec(ctx, "select pg_drop_replication_slot($1)", slotName); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42704" { // undefined_object
+			return nil
+		}
+		return fmt.Errorf("cannot drop replication slot=%s, error=%w", slotName, err)
+	}
+	return nil
 }
 
 // pgVersion gets postgres server version and checks it is supported.
@@ -169,12 +218,12 @@ func ReplicateDatabase(rootContext context.Context, database SourceDatabase, url
 	slotName = strings.ReplaceAll(slotName, "-", "_")
 	var publication, slot int
 	err = conn.QueryRow(context.Background(), `with publication as (
-							select count(*) as publication 
-							from pg_publication 
-							where pubname=$1), 
-						slot as (select count(*) as slot 
-							from pg_replication_slots 
-							where slot_name=$1) 
+							select count(*) as publication
+							from pg_publication
+							where pubname=$1),
+						slot as (select count(*) as slot
+							from pg_replication_slots
+							where slot_name=$1)
 						select publication.publication, slot.slot from publication,slot;`, slotName).Scan(&publication, &slot)
 	if err != nil {
 		return fmt.Errorf("cannot check publication and slot, error=%w", err)
@@ -193,10 +242,11 @@ func ReplicateDatabase(rootContext context.Context, database SourceDatabase, url
 		}
 	} else {
 		if publication == 0 && slot == 1 { // slot without publication, drop it
-			_, err = conn.Exec(context.Background(), `select pg_drop_replication_slot($1)`, slotName)
-			if err != nil {
-				return fmt.Errorf("cannot drop replication slot, error=%w", err)
+			if err = dropReplicationSlot(context.Background(), conn, slotName); err != nil {
+				return err
 			}
+			// any local state belonging to the dropped slot is stale
+			_ = removeSlotState(log, database.Name, url.SID)
 		}
 		if publication == 1 && slot == 0 { // publication may have been created by mistake, remove it
 			_, err = conn.Exec(context.Background(), "drop publication "+slotName)
@@ -211,28 +261,125 @@ func ReplicateDatabase(rootContext context.Context, database SourceDatabase, url
 			return fmt.Errorf("cannot create publication, error=%w", err)
 		}
 	}
-	// Create slot if it does not exist, fail if there is an existing consumer
-	oldSlot, lsn, err := createReplicationSlot(log, conn, slotName, sysident.XLogPos)
+
+	// Recover persisted state. It distinguishes a stream whose initial snapshot
+	// never finished from one that already entered incremental WAL replay.
+	state, stateErr := loadSlotState(log, database.Name, url.SID)
+	if stateErr != nil && !errors.Is(stateErr, errStateNotFound) {
+		return fmt.Errorf("cannot load replication state, error=%w", stateErr)
+	}
+	if stateErr == nil && state.Phase == PhaseSnapshot {
+		// The previous attempt died (or was restarted) while the initial full
+		// read was in progress. The half-copied data cannot be treated as a
+		// completed initialisation: drop the slot and redo the whole snapshot
+		// against a freshly exported boundary.
+		log.Warn("Found unfinished initial snapshot, dropping slot and redoing full sync",
+			"slotname", state.SlotName, "lsn", state.SlotLSN)
+		if err = dropReplicationSlot(context.Background(), conn, state.SlotName); err != nil {
+			return err
+		}
+		if err = truncateDestinationTables(log, database.Name, url.SID, database.Tables); err != nil {
+			return fmt.Errorf("cannot clean destination before snapshot redo, error=%w", err)
+		}
+		if err = removeSlotState(log, database.Name, url.SID); err != nil {
+			return err
+		}
+		state = nil
+	} else if stateErr == nil && state.Phase == PhaseStreaming {
+		// State claims streaming already started. If the slot vanished on the
+		// server (e.g. manual drop), the destination must be rebuilt from
+		// scratch rather than resumed from a guessed position.
+		var slotExists bool
+		if err = conn.QueryRow(ctx,
+			"select exists(select 1 from pg_replication_slots where slot_name=$1)",
+			state.SlotName).Scan(&slotExists); err != nil {
+			return fmt.Errorf("cannot check replication slot existence, error=%w", err)
+		}
+		if !slotExists {
+			log.Warn("Streaming state exists but slot is missing on server, rebuilding from scratch",
+				"slotname", state.SlotName)
+			if err = truncateDestinationTables(log, database.Name, url.SID, database.Tables); err != nil {
+				return fmt.Errorf("cannot clean destination before rebuild, error=%w", err)
+			}
+			if err = removeSlotState(log, database.Name, url.SID); err != nil {
+				return err
+			}
+			state = nil
+		}
+	}
+
+	// Create slot if it does not exist; an existing slot means we already
+	// entered incremental replay and must resume from its confirmed_flush_lsn.
+	created, slotInfo, err := createReplicationSlot(log, conn, slotName)
 	if err != nil {
 		return fmt.Errorf("cannot create replication slot, error=%w", err)
 	}
 
-	// Perform full table sync if slot was just created
-	if !oldSlot {
-		err := syncAllTables(log, database.Name, url.SID, database.Tables, replConn)
+	if created {
+		// Persist the snapshot boundary BEFORE reading any data: a crash from
+		// this point on is recovered as "unfinished snapshot", never as a
+		// completed initialisation.
+		state = &SlotState{
+			SlotName:     slotInfo.slotName,
+			Phase:        PhaseSnapshot,
+			SlotLSN:      slotInfo.slotLSN,
+			SnapshotName: slotInfo.snapshotName,
+		}
+		if err = writeSlotState(log, database.Name, url.SID, state); err != nil {
+			return err
+		}
+
+		// Full read of every configured table in a separate read transaction
+		// that imports the snapshot exported by the slot creation. All tables
+		// are therefore seen at the single slot consistency point.
+		err = syncAllTables(log, database.Name, url.SID, database.Tables, url.URL, slotInfo.snapshotName)
 		if err != nil {
 			return fmt.Errorf("cannot perform initial sync, error=%w", err)
 		}
-		log.Debug("Finished full table sync")
+		log.Info("Finished full table sync", "snapshot", slotInfo.snapshotName)
+
+		// Snapshot fully read and committed: only now may we enter streaming.
+		state.Phase = PhaseStreaming
+		state.SnapshotName = ""
+		if err = writeSlotState(log, database.Name, url.SID, state); err != nil {
+			return err
+		}
 		time.Sleep(time.Duration(config.Maintenance.StartDelay) * time.Second)
 	} else {
-		err := syncNewTables(log, database.Name, url.SID, database.Tables, newTables, replConn)
+		// Existing slot: the initial snapshot was completed in a previous run
+		// (or the slot was created outside this state file). Newly added tables
+		// are synced on their own read transaction; see the limitation note in
+		// syncNewTables.
+		if state == nil {
+			log.Warn("Replication slot exists without local state, assuming initial snapshot was completed",
+				"slotname", slotInfo.slotName, "lsn", slotInfo.slotLSN)
+			state = &SlotState{
+				SlotName: slotInfo.slotName,
+				Phase:    PhaseStreaming,
+				SlotLSN:  slotInfo.slotLSN,
+			}
+			if err = writeSlotState(log, database.Name, url.SID, state); err != nil {
+				return err
+			}
+		}
+		if state.Phase != PhaseStreaming {
+			return fmt.Errorf("unexpected replication state phase=%s for existing slot=%s", state.Phase, slotName)
+		}
+		// Resume from the slot's confirmed_flush_lsn (slotInfo.slotLSN), which
+		// is authoritative on the server and always shares a boundary with the
+		// WAL stream; never fall back to a position guessed before slot
+		// creation. The persisted LSN is kept as a sanity record.
+		log.Info("Resuming streaming from existing slot",
+			"slotname", slotInfo.slotName, "confirmed_flush_lsn", slotInfo.slotLSN,
+			"persisted_lsn", state.SlotLSN)
+		err = syncNewTables(log, database.Name, url.SID, database.Tables, newTables, url.URL)
 		if err != nil {
 			return fmt.Errorf("cannot perform initial sync for new tables, error=%w", err)
 		}
 		log.Debug("Finished full table sync for new tables")
 		time.Sleep(time.Duration(config.Maintenance.StartDelay) * time.Second)
 	}
+	lsn := slotInfo.slotLSN
 
 	// Start replication
 	log.Debug("Starting replication slot")

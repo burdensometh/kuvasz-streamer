@@ -13,4 +13,7 @@ url = "postgres://kuvasz:kuvasz@127.0.0.1/dest?application_name=kuvasz-streamer"
 
 [app]
 map_file = "/etc/kuvasz/map.yaml"
+# Directory where replication slot/snapshot state is persisted so a restart can
+# distinguish an unfinished initial snapshot from active WAL streaming.
+state_directory = "/var/lib/kuvasz-streamer/state"
 
